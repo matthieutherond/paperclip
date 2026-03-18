@@ -26,6 +26,7 @@ import {
   buildAgentImage,
   getDockerNetworkName,
   type CredentialProxyConfig,
+  type GitHubAppConfig,
 } from "./infra.js";
 
 async function readOauthTokenFromKeychain(): Promise<string> {
@@ -167,11 +168,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const explicitOauthToken = asString(config.oauthToken, "");
   const githubToken = asString(config.githubToken, "");
   const protectedBranches = asStringArray(config.protectedBranches);
+
+  // GitHub App config (alternative to static githubToken)
+  const ghAppConfig = parseObject(config.githubApp);
+  const ghAppId = asString(ghAppConfig.appId, "");
+  const ghInstallId = asString(ghAppConfig.installationId, "");
+  const ghKeyPath = asString(ghAppConfig.privateKeyPath, "");
+  const githubApp: GitHubAppConfig | undefined =
+    ghAppId && ghInstallId && ghKeyPath
+      ? { appId: ghAppId, installationId: ghInstallId, privateKeyPath: ghKeyPath }
+      : undefined;
+
   const proxyConfig: CredentialProxyConfig = {
     ...(explicitApiKey
       ? { authMode: "api-key" as const, apiKey: explicitApiKey }
       : { authMode: "oauth" as const, oauthToken: explicitOauthToken || await readOauthTokenFromKeychain() }),
-    githubToken,
+    githubToken: githubToken || undefined,
+    githubApp,
     protectedBranches: protectedBranches.length > 0 ? protectedBranches : undefined,
   };
 
@@ -270,7 +283,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ];
 
     // GitHub: route git and gh CLI through the credential proxy
-    if (githubToken) {
+    if (githubToken || githubApp) {
       // Rewrite github.com URLs to go through the proxy
       dockerArgs.push("-e", "GIT_CONFIG_COUNT=2");
       dockerArgs.push("-e", "GIT_CONFIG_KEY_0=url.http://credential-proxy:3001/gh/.insteadOf");
