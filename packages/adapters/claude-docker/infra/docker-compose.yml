@@ -1,0 +1,15 @@
+services:
+  credential-proxy:
+    image: node:20-slim
+    command: ["node", "/proxy/credential-proxy.mjs"]
+    volumes:
+      - ./credential-proxy.mjs:/proxy/credential-proxy.mjs:ro
+    env_file:
+      - path: .env
+        required: false
+    networks: [agent-net]
+    restart: unless-stopped
+
+networks:
+  agent-net:
+    driver: bridge

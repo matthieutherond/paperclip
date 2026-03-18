@@ -49,6 +49,7 @@ const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
+  "claude_docker",
   "codex_local",
   "cursor",
   "gemini_local",

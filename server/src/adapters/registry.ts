@@ -6,6 +6,12 @@ import {
 } from "@paperclipai/adapter-claude-local/server";
 import { agentConfigurationDoc as claudeAgentConfigurationDoc, models as claudeModels } from "@paperclipai/adapter-claude-local";
 import {
+  execute as claudeDockerExecute,
+  testEnvironment as claudeDockerTestEnvironment,
+  sessionCodec as claudeDockerSessionCodec,
+} from "@paperclipai/adapter-claude-docker/server";
+import { agentConfigurationDoc as claudeDockerAgentConfigurationDoc, models as claudeDockerModels } from "@paperclipai/adapter-claude-docker";
+import {
   execute as codexExecute,
   testEnvironment as codexTestEnvironment,
   sessionCodec as codexSessionCodec,
@@ -71,6 +77,16 @@ const claudeLocalAdapter: ServerAdapterModule = {
   models: claudeModels,
   supportsLocalAgentJwt: true,
   agentConfigurationDoc: claudeAgentConfigurationDoc,
+};
+
+const claudeDockerAdapter: ServerAdapterModule = {
+  type: "claude_docker",
+  execute: claudeDockerExecute,
+  testEnvironment: claudeDockerTestEnvironment,
+  sessionCodec: claudeDockerSessionCodec,
+  models: claudeDockerModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: claudeDockerAgentConfigurationDoc,
 };
 
 const codexLocalAdapter: ServerAdapterModule = {
@@ -149,6 +165,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
 const adaptersByType = new Map<string, ServerAdapterModule>(
   [
     claudeLocalAdapter,
+    claudeDockerAdapter,
     codexLocalAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,

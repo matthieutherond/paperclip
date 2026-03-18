@@ -25,6 +25,7 @@ export const AGENT_ADAPTER_TYPES = [
   "process",
   "http",
   "claude_local",
+  "claude_docker",
   "codex_local",
   "opencode_local",
   "pi_local",
