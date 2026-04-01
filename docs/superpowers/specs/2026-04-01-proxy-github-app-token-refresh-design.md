@@ -29,9 +29,13 @@ A new async function called before every `/gh/` and `/gh-api/` request:
 
 **Integration point**: The existing `/gh/` and `/gh-api/` handlers currently read `GITHUB_TOKEN` synchronously. Change to `await getGitHubToken()` before constructing headers. This makes the request handler async (it already buffers the full body before processing, so this is straightforward).
 
+**Concurrency**: If multiple requests hit the proxy simultaneously with an expired token, deduplicate the refresh by storing a pending Promise. The first caller triggers the token exchange; concurrent callers await the same Promise. This avoids thundering herd on the GitHub token endpoint.
+
+**Branch protection guard**: The existing branch protection check (`if (GITHUB_TOKEN)`) must be updated to use the resolved token from `getGitHubToken()`, since `GITHUB_TOKEN` env is not set in App mode. The guard becomes: if a token was resolved (static or App), inspect push refs for protected branches.
+
 ### Infrastructure (`docker-compose.yml`)
 
-Add an optional volume mount for the private key:
+Add an optional volume mount for the private key. The `GITHUB_APP_KEY_PATH` env var serves dual purpose: docker-compose reads it for the volume mount (compose substitutes from `.env` at the project root), and the proxy container receives it for logging/diagnostics only (the container always reads the key from the fixed mount path `/secrets/github-app.pem`).
 
 ```yaml
 services:
@@ -48,7 +52,9 @@ services:
     restart: unless-stopped
 ```
 
-When `GITHUB_APP_KEY_PATH` is not set, `/dev/null` is mounted — the proxy sees an empty file and falls back to `GITHUB_TOKEN` or no-auth mode.
+When `GITHUB_APP_KEY_PATH` is not set, `/dev/null` is mounted — the proxy sees an empty file and falls back to `GITHUB_TOKEN` or no-auth mode. This relies on `/dev/null` existing on the Docker host (Linux/macOS). Windows Docker Desktop users would need to set the path explicitly.
+
+Note: the proxy uses the hardcoded container path `/secrets/github-app.pem` to read the key, not the `GITHUB_APP_KEY_PATH` env var. The env var is only consumed by docker-compose for the volume bind source.
 
 ### Host-Side Changes (`infra.ts`)
 
@@ -77,3 +83,9 @@ Remove the `GITHUB_TOKEN` entry for App mode (the proxy generates its own).
 - If the private key file is unreadable at request time → log error, return 502 to the agent with a descriptive message.
 - If GitHub token exchange fails (bad App ID, revoked key, etc.) → log error, return 502.
 - Transient GitHub API failures → no retry on the proxy side; the agent's `gh` CLI or git will retry or surface the error.
+- No startup probe for key readability. The proxy starts successfully even if the key is missing/empty; the first GitHub request surfaces the error. This is intentional — it keeps the proxy simple and avoids blocking non-GitHub traffic.
+
+### Implementation Notes
+
+- The JWT lifetime (10 min) and the installation token lifetime (1 hour, set by GitHub) are distinct. The JWT is ephemeral — generated fresh for each token exchange. The installation token is cached using the `expires_at` field from GitHub's response, not derived from the JWT.
+- The `GITHUB_APP_PRIVATE_KEY_PATH` inside the container is always `/secrets/github-app.pem` (the mount target). The host path is only used by docker-compose.
