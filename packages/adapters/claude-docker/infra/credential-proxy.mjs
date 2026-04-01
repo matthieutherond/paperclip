@@ -12,6 +12,8 @@
  */
 import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
+import crypto from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 // --- Anthropic config ---
 const ANTHROPIC_URL = new URL(process.env.UPSTREAM_URL || "https://api.anthropic.com");
@@ -23,6 +25,93 @@ const AUTH_MODE = API_KEY ? "api-key" : "oauth";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const PROTECTED_BRANCHES = (process.env.PROTECTED_BRANCHES || "main,master")
   .split(",").map(b => b.trim()).filter(Boolean);
+
+// --- GitHub App config (alternative to static GITHUB_TOKEN) ---
+const GITHUB_APP_ID = process.env.GITHUB_APP_ID || "";
+const GITHUB_APP_INSTALLATION_ID = process.env.GITHUB_APP_INSTALLATION_ID || "";
+const GITHUB_APP_PRIVATE_KEY_PATH = "/secrets/github-app.pem";
+
+let cachedInstallToken = null; // { token: string, expiresAt: number }
+let pendingTokenRefresh = null; // Promise dedup
+
+function generateGitHubJwt(appId, privateKey) {
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  const payload = Buffer.from(JSON.stringify({ iat: now - 60, exp: now + 540, iss: appId })).toString("base64url");
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(`${header}.${payload}`), privateKey).toString("base64url");
+  return `${header}.${payload}.${signature}`;
+}
+
+function requestInstallationToken(jwt, installationId) {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest({
+      hostname: "api.github.com",
+      path: `/app/installations/${installationId}/access_tokens`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "paperclip-credential-proxy",
+        "Content-Length": 0,
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.token) {
+            resolve({ token: parsed.token, expires_at: parsed.expires_at });
+          } else {
+            reject(new Error(`GitHub App token exchange failed: ${data}`));
+          }
+        } catch {
+          reject(new Error(`GitHub App token response parse error: ${data}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+async function refreshGitHubAppToken() {
+  const privateKey = await readFile(GITHUB_APP_PRIVATE_KEY_PATH, "utf-8");
+  if (!privateKey.trim()) {
+    throw new Error("GitHub App private key is empty (check volume mount)");
+  }
+  const jwt = generateGitHubJwt(GITHUB_APP_ID, privateKey);
+  const result = await requestInstallationToken(jwt, GITHUB_APP_INSTALLATION_ID);
+  cachedInstallToken = {
+    token: result.token,
+    expiresAt: new Date(result.expires_at).getTime(),
+  };
+  console.log(`GitHub App token refreshed, expires at ${result.expires_at}`);
+  return cachedInstallToken.token;
+}
+
+async function getGitHubToken() {
+  // Static token takes precedence
+  if (GITHUB_TOKEN) return GITHUB_TOKEN;
+
+  // No App config → no GitHub auth
+  if (!GITHUB_APP_ID || !GITHUB_APP_INSTALLATION_ID) return "";
+
+  // Cached token still valid?
+  if (cachedInstallToken && cachedInstallToken.expiresAt - Date.now() > REFRESH_MARGIN_MS) {
+    return cachedInstallToken.token;
+  }
+
+  // Deduplicate concurrent refresh requests
+  if (pendingTokenRefresh) return pendingTokenRefresh;
+
+  pendingTokenRefresh = refreshGitHubAppToken().finally(() => {
+    pendingTokenRefresh = null;
+  });
+  return pendingTokenRefresh;
+}
 
 const PORT = parseInt(process.env.PROXY_PORT || "3001", 10);
 const HOST = process.env.PROXY_HOST || "0.0.0.0";
