@@ -4,6 +4,7 @@ services:
     command: ["node", "/proxy/credential-proxy.mjs"]
     volumes:
       - ./credential-proxy.mjs:/proxy/credential-proxy.mjs:ro
+      - ${GITHUB_APP_KEY_PATH:-/dev/null}:/secrets/github-app.pem:ro
     env_file:
       - path: .env
         required: false
