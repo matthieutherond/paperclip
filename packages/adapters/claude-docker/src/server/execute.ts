@@ -58,7 +58,7 @@ async function resolvePaperclipSkillsDir(): Promise<string | null> {
   return null;
 }
 
-async function buildSkillsDir(): Promise<string> {
+async function buildSkillsDir(enabledPlugins?: string[]): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-"));
   const target = path.join(tmp, ".claude", "skills");
   await fs.mkdir(target, { recursive: true });
@@ -67,9 +67,36 @@ async function buildSkillsDir(): Promise<string> {
   const entries = await fs.readdir(skillsDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      await fs.symlink(path.join(skillsDir, entry.name), path.join(target, entry.name));
+      await fs.cp(path.join(skillsDir, entry.name), path.join(target, entry.name), { recursive: true });
     }
   }
+
+  // Copy enabled Claude Code plugins from the host into the skills dir
+  // so they're available inside the Docker container
+  if (enabledPlugins?.length) {
+    const pluginsCacheDir = path.join(os.homedir(), ".claude", "plugins", "cache");
+    for (const pluginId of enabledPlugins) {
+      // Plugin IDs look like "code-simplifier@claude-plugins-official"
+      const [pluginName, registry] = pluginId.includes("@")
+        ? pluginId.split("@") : [pluginId, "claude-plugins-official"];
+      const registryDir = path.join(pluginsCacheDir, registry, pluginName);
+      const exists = await fs.stat(registryDir).then((s) => s.isDirectory()).catch(() => false);
+      if (!exists) continue;
+      // Find the latest version dir (non-dot, non-orphaned)
+      const versions = await fs.readdir(registryDir, { withFileTypes: true });
+      for (const ver of versions) {
+        if (!ver.isDirectory() || ver.name.startsWith(".")) continue;
+        const orphanedMarker = path.join(registryDir, ver.name, ".orphaned_at");
+        const isOrphaned = await fs.stat(orphanedMarker).catch(() => null);
+        if (isOrphaned) continue;
+        // Copy plugin into skills dir under its plugin name
+        const pluginTarget = path.join(target, `plugin-${pluginName}`);
+        await fs.cp(path.join(registryDir, ver.name), pluginTarget, { recursive: true }).catch(() => {});
+        break; // take first non-orphaned version
+      }
+    }
+  }
+
   return tmp;
 }
 
@@ -149,18 +176,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const model = asString(config.model, "");
   const effort = asString(config.effort, "");
-  const maxTurns = asNumber(config.maxTurnsPerRun, 0);
+  const maxTurns = asNumber(config.maxTurnsPerRun, 500);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const timeoutSec = asNumber(config.timeoutSec, 0);
   const graceSec = asNumber(config.graceSec, 20);
   const extraArgs = asStringArray(config.extraArgs);
   const dockerImage = asString(config.dockerImage, "paperclip-agent:latest");
 
   // Resolve workspace directory
+  // For Docker: prefer adapter config cwd (explicit mount target), then workspace context, then fallback
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
   const configuredCwd = asString(config.cwd, "");
-  const cwd = workspaceCwd || configuredCwd || process.cwd();
+  const cwd = configuredCwd || workspaceCwd || process.cwd();
 
   // Resolve credential proxy config
   // Priority: config.apiKey > config.oauthToken > auto-detect from keychain
@@ -192,6 +221,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const envConfig = parseObject(config.env);
   const agentEnv: Record<string, string> = { ...buildPaperclipEnv(agent) };
   agentEnv.PAPERCLIP_RUN_ID = runId;
+
+  // Rewrite localhost API URL for Docker — container can't reach host's localhost
+  if (agentEnv.PAPERCLIP_API_URL) {
+    agentEnv.PAPERCLIP_API_URL = agentEnv.PAPERCLIP_API_URL
+      .replace("://localhost:", "://host.docker.internal:")
+      .replace("://127.0.0.1:", "://host.docker.internal:")
+      .replace("://0.0.0.0:", "://host.docker.internal:");
+  }
 
   const wakeTaskId =
     (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
@@ -226,8 +263,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await buildAgentImage(onLog);
   await ensureProxyRunning(proxyConfig, onLog);
 
-  // Build skills directory
-  const skillsDir = await buildSkillsDir();
+  // Build skills directory (with optional plugins from host)
+  const enabledPlugins = asStringArray(config.enabledPlugins);
+  const skillsDir = await buildSkillsDir(enabledPlugins.length > 0 ? enabledPlugins : undefined);
+
+  // When instructionsFilePath is configured, read the file from the host and write
+  // it into the skills dir (which gets mounted as /skills in the container).
+  // The container then uses --append-system-prompt-file to load it.
+  let containerInstructionsPath = "";
+  if (instructionsFilePath) {
+    const resolvedPath = path.isAbsolute(instructionsFilePath)
+      ? instructionsFilePath
+      : path.resolve(cwd, instructionsFilePath);
+    try {
+      const content = await fs.readFile(resolvedPath, "utf-8");
+      const directive = `\nThe above agent instructions were loaded from ${instructionsFilePath}. Resolve any relative file references from ${path.dirname(instructionsFilePath)}/.`;
+      await fs.writeFile(path.join(skillsDir, "agent-instructions.md"), content + directive, "utf-8");
+      containerInstructionsPath = "/skills/agent-instructions.md";
+    } catch (err) {
+      await onLog("stderr", `[claude-docker] Warning: could not read instructions file ${resolvedPath}: ${err}\n`);
+    }
+  }
+
+  // MCP servers config: write a .mcp.json into skills dir and pass --mcp-config
+  const mcpServers = parseObject(config.mcpServers);
+  let containerMcpConfigPath = "";
+  if (Object.keys(mcpServers).length > 0) {
+    const mcpConfig = JSON.stringify({ mcpServers }, null, 2);
+    await fs.writeFile(path.join(skillsDir, ".mcp.json"), mcpConfig, "utf-8");
+    containerMcpConfigPath = "/skills/.mcp.json";
+  }
 
   // Session handling
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -261,6 +326,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (model) args.push("--model", model);
     if (effort) args.push("--effort", effort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
+    if (containerInstructionsPath) args.push("--append-system-prompt-file", containerInstructionsPath);
+    if (containerMcpConfigPath) args.push("--mcp-config", containerMcpConfigPath);
     args.push("--add-dir", "/skills");
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
@@ -272,6 +339,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const dockerArgs = [
       "run", "--rm", "-i",
       "--network", getDockerNetworkName(),
+      "--add-host=host.docker.internal:host-gateway",
       "--cap-drop=ALL",
       "--security-opt", "no-new-privileges",
       "-e", "ANTHROPIC_BASE_URL=http://credential-proxy:3001",
@@ -280,29 +348,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : "CLAUDE_CODE_OAUTH_TOKEN=placeholder",
       "-v", `${cwd}:/workspace`,
       "-v", `${skillsDir}:/skills:ro`,
+      "-v", "paperclip-agent-cache:/home/agent/.cache",
     ];
 
     // GitHub: route git and gh CLI through the credential proxy
     if (githubToken || githubApp) {
-      // Rewrite github.com URLs to go through the proxy
-      dockerArgs.push("-e", "GIT_CONFIG_COUNT=2");
-      dockerArgs.push("-e", "GIT_CONFIG_KEY_0=url.http://credential-proxy:3001/gh/.insteadOf");
-      dockerArgs.push("-e", "GIT_CONFIG_VALUE_0=https://github.com/");
-      // Credential helper returns placeholder — proxy swaps it for the real token
-      dockerArgs.push("-e", "GIT_CONFIG_KEY_1=credential.http://credential-proxy:3001.helper");
-      dockerArgs.push("-e", `GIT_CONFIG_VALUE_1=!f() { echo username=x-access-token; echo password=placeholder; }; f`);
+      // Git identity + rewrite rules + credential helper
+      const gitConfigEntries = [
+        ["user.name", agent.name ?? "Paperclip Agent"],
+        ["user.email", "agent@paperclip.ing"],
+        ["url.http://credential-proxy:3001/gh/.insteadOf", "https://github.com/"],
+        ["url.http://credential-proxy:3001/gh/.insteadOf", "git@github.com:"],
+        ["credential.http://credential-proxy:3001.helper", "!f() { echo username=x-access-token; echo password=placeholder; }; f"],
+      ];
+      dockerArgs.push("-e", `GIT_CONFIG_COUNT=${gitConfigEntries.length}`);
+      for (let i = 0; i < gitConfigEntries.length; i++) {
+        dockerArgs.push("-e", `GIT_CONFIG_KEY_${i}=${gitConfigEntries[i][0]}`);
+        dockerArgs.push("-e", `GIT_CONFIG_VALUE_${i}=${gitConfigEntries[i][1]}`);
+      }
       dockerArgs.push("-e", "GIT_TERMINAL_PROMPT=0");
-      // gh CLI uses GITHUB_API_URL
-      dockerArgs.push("-e", "GITHUB_API_URL=http://credential-proxy:3001/gh-api");
-      // GH_TOKEN placeholder so gh CLI doesn't complain about auth
-      dockerArgs.push("-e", "GH_TOKEN=placeholder");
+      // gh CLI: fetch a real token from the credential proxy at container startup.
+      // GITHUB_API_URL is NOT respected by gh CLI, so we provide a real token instead.
+      // The proxy's /gh-token endpoint returns a fresh GitHub App installation token.
+      dockerArgs.push("-e", "PAPERCLIP_GH_TOKEN_URL=http://credential-proxy:3001/gh-token");
     }
 
     for (const [key, value] of Object.entries(agentEnv)) {
       dockerArgs.push("-e", `${key}=${value}`);
     }
 
-    dockerArgs.push(dockerImage, "claude", ...claudeArgs);
+    // If GitHub is configured, wrap the command to fetch a real token at startup.
+    // gh CLI doesn't respect GITHUB_API_URL, so we need a real GH_TOKEN.
+    const hasGitHub = githubToken || githubApp;
+    if (hasGitHub) {
+      const claudeCmd = ["claude", ...claudeArgs].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(" ");
+      dockerArgs.push(dockerImage, "sh", "-c",
+        `export GH_TOKEN=$(curl -sf "$PAPERCLIP_GH_TOKEN_URL" || echo "") && exec ${claudeCmd}`);
+    } else {
+      dockerArgs.push(dockerImage, "claude", ...claudeArgs);
+    }
 
     if (onMeta) {
       await onMeta({

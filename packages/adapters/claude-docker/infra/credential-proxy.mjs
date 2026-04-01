@@ -173,6 +173,25 @@ const server = createServer((req, res) => {
     const body = Buffer.concat(chunks);
     const url = req.url || "/";
 
+    // --- Token endpoint: returns a valid GitHub token for gh CLI ---
+    if (url === "/gh-token" && req.method === "GET") {
+      try {
+        const token = await getGitHubToken();
+        if (!token) {
+          res.writeHead(404, { "content-type": "text/plain" });
+          res.end("No GitHub token configured\n");
+          return;
+        }
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end(token);
+      } catch (err) {
+        console.error(`GitHub token resolution failed: ${err.message}`);
+        res.writeHead(502, { "content-type": "text/plain" });
+        res.end(`GitHub auth error: ${err.message}\n`);
+      }
+      return;
+    }
+
     // Resolve GitHub token (static or App-generated)
     let githubToken = "";
     if (url.startsWith("/gh/") || url.startsWith("/gh-api/")) {
