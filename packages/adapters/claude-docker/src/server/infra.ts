@@ -145,7 +145,13 @@ export function buildProxyEnv(config: CredentialProxyConfig): Record<string, str
   } else if (config.oauthToken) {
     env.CLAUDE_CODE_OAUTH_TOKEN = config.oauthToken;
   }
-  if (config.githubToken) {
+  if (config.githubApp) {
+    // App mode: pass credentials so the proxy generates its own tokens
+    env.GITHUB_APP_ID = config.githubApp.appId;
+    env.GITHUB_APP_INSTALLATION_ID = config.githubApp.installationId;
+    env.GITHUB_APP_KEY_PATH = config.githubApp.privateKeyPath;
+  } else if (config.githubToken) {
+    // Static token mode
     env.GITHUB_TOKEN = config.githubToken;
   }
   if (config.protectedBranches?.length) {
@@ -158,11 +164,8 @@ export async function ensureProxyRunning(
   config: CredentialProxyConfig,
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
 ): Promise<void> {
-  // If using GitHub App, resolve the installation token first
-  if (config.githubApp && !config.githubToken) {
-    await onLog("stderr", "[claude-docker] Generating GitHub App installation token...\n");
-    config.githubToken = await getGitHubInstallationToken(config.githubApp);
-    await onLog("stderr", "[claude-docker] GitHub App token acquired.\n");
+  if (config.githubApp) {
+    await onLog("stderr", "[claude-docker] GitHub App configured — proxy will manage token refresh.\n");
   }
 
   const infraDir = await resolveInfraDir();
