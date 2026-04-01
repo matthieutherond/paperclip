@@ -169,16 +169,29 @@ function forwardRequest({ hostname, port, basePath, path, method, headers, body,
 const server = createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
+  req.on("end", async () => {
     const body = Buffer.concat(chunks);
     const url = req.url || "/";
+
+    // Resolve GitHub token (static or App-generated)
+    let githubToken = "";
+    if (url.startsWith("/gh/") || url.startsWith("/gh-api/")) {
+      try {
+        githubToken = await getGitHubToken();
+      } catch (err) {
+        console.error(`GitHub token resolution failed: ${err.message}`);
+        res.writeHead(502, { "content-type": "text/plain" });
+        res.end(`GitHub auth error: ${err.message}\n`);
+        return;
+      }
+    }
 
     // --- GitHub git traffic: /gh/org/repo.git/... ---
     if (url.startsWith("/gh/")) {
       const ghPath = url.slice(3); // strip "/gh" prefix, keep leading "/"
 
       // Branch protection: block pushes to protected branches
-      if (req.method === "POST" && ghPath.includes("/git-receive-pack") && GITHUB_TOKEN) {
+      if (req.method === "POST" && ghPath.includes("/git-receive-pack") && githubToken) {
         const refs = extractPushRefs(body);
         const blocked = refs.filter(isProtectedRef);
         if (blocked.length > 0) {
@@ -191,9 +204,9 @@ const server = createServer((req, res) => {
 
       const headers = { ...req.headers, host: "github.com", "content-length": body.length };
       delete headers["connection"]; delete headers["keep-alive"]; delete headers["transfer-encoding"];
-      if (GITHUB_TOKEN) {
+      if (githubToken) {
         delete headers["authorization"];
-        headers["authorization"] = `Basic ${Buffer.from(`x-access-token:${GITHUB_TOKEN}`).toString("base64")}`;
+        headers["authorization"] = `Basic ${Buffer.from(`x-access-token:${githubToken}`).toString("base64")}`;
       }
 
       forwardRequest({ hostname: "github.com", port: 443, basePath: "", path: ghPath, method: req.method, headers, body, res });
@@ -206,9 +219,9 @@ const server = createServer((req, res) => {
 
       const headers = { ...req.headers, host: "api.github.com", "content-length": body.length };
       delete headers["connection"]; delete headers["keep-alive"]; delete headers["transfer-encoding"];
-      if (GITHUB_TOKEN) {
+      if (githubToken) {
         delete headers["authorization"];
-        headers["authorization"] = `Bearer ${GITHUB_TOKEN}`;
+        headers["authorization"] = `Bearer ${githubToken}`;
       }
 
       forwardRequest({ hostname: "api.github.com", port: 443, basePath: "", path: apiPath, method: req.method, headers, body, res });
@@ -248,7 +261,8 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, HOST, () => {
   const features = [AUTH_MODE];
-  if (GITHUB_TOKEN) features.push("github");
+  if (GITHUB_TOKEN) features.push("github:static-token");
+  if (GITHUB_APP_ID) features.push(`github:app(${GITHUB_APP_ID})`);
   if (PROTECTED_BRANCHES.length) features.push(`protected: ${PROTECTED_BRANCHES.join(",")}`);
   console.log(`Credential proxy started on ${HOST}:${PORT} [${features.join(" | ")}]`);
 });
